@@ -1,4 +1,4 @@
-﻿using HarmonyLib;
+using HarmonyLib;
 using Sandbox;
 using Sandbox.Engine.Multiplayer;
 using Sandbox.Engine.Networking;
@@ -25,7 +25,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using ParallelTasks;
 using VRage;
@@ -38,7 +37,6 @@ using VRage.Network;
 using VRage.Utils;
 using VRageRender;
 using VRageRender.Messages;
-using Task = System.Threading.Tasks.Task;
 
 namespace SeamlessClient.Components
 {
@@ -46,6 +44,12 @@ namespace SeamlessClient.Components
     {
         private static bool isSeamlessSwitching { get; set; } = false;
         private static bool WaitingForClientCheck { get; set; } = false;
+        private static bool JoinAccepted;
+        private static bool ReplicationComplete;
+        private static DateTime TransferStartedUtc;
+        private static readonly TimeSpan TransferTimeout = TimeSpan.FromSeconds(90);
+        private static MyMultiplayerBase TransferClient;
+        private static Action ReplicationHandler;
 
 
         private static ConstructorInfo TransportLayerConstructor;
@@ -101,14 +105,9 @@ namespace SeamlessClient.Components
 
         public override void Update()
         {
-            //Toggle waiting for client check
-            if (WaitingForClientCheck == false && isSeamlessSwitching)
-                WaitingForClientCheck = true;
+            UpdateTransferReadiness();
 
-            if(WaitingForClientCheck && MySession.Static?.LocalHumanPlayer != null)
-                WaitingForClientCheck = false;
-
-            if (isSeamlessSwitching || WaitingForClientCheck && TargetServer != null)
+            if ((isSeamlessSwitching || WaitingForClientCheck) && TargetServer != null)
             {
                 //SeamlessClient.TryShow("Switching Servers!");
                 MyRenderProxy.DebugDrawText2D(new VRageMath.Vector2(MySandboxGame.ScreenViewport.Width/ 2, MySandboxGame.ScreenViewport.Height - 250), SwitchingText, VRageMath.Color.AliceBlue, 1f, MyGuiDrawAlignEnum.HORISONTAL_CENTER_AND_VERTICAL_CENTER);
@@ -126,124 +125,158 @@ namespace SeamlessClient.Components
 
         public override void Destroy()
         {
-            myCommands.Dispose();
+            CancelTransfer();
+            myCommands?.Dispose();
             base.Destroy();
         }
 
      
-        private static void OnUserJoined(ref JoinResultMsg msg)
+        private static void OnUserJoined(object __instance, ref JoinResultMsg msg)
         {
+            // Harmony runs for every multiplayer client; ignore old clients and duplicate joins.
+            if (!isSeamlessSwitching || JoinAccepted || !ReferenceEquals(__instance, TransferClient))
+                return;
+
             if (msg.JoinResult == JoinResult.OK && isSeamlessSwitching)
             {
-                //Invoke the switch event
-                SwitchingText = "Server Responded! Removing Old Entities and forcing client connection!";
-                EntityUtils.RemoveOldClientEntities();
-                ForceClientConnection();
-                ModAPI.ServerSwitched();
+                JoinAccepted = true;
+                try
+                {
+                    //Invoke the switch event
+                    SwitchingText = "Server Responded! Removing Old Entities and forcing client connection!";
+                    EntityUtils.RemoveOldClientEntities();
+                    ForceClientConnection();
+                    ModAPI.ServerSwitched();
      
-                //Keen, why oh why does this have to be private... And i have to send the client skins to the server???
-                UpdateLocalPlayerGameInventory.Invoke(MySession.Static.GetComponent<MySessionComponentGameInventory>(), null);
+                    //Keen, why oh why does this have to be private... And i have to send the client skins to the server???
+                    UpdateLocalPlayerGameInventory.Invoke(MySession.Static.GetComponent<MySessionComponentGameInventory>(), null);
       
-                //reset character movement
-                MySession.Static.LocalHumanPlayer?.Character?.Stand();
-     
-                isSeamlessSwitching = false;
-
-                StartConnectionWatchdog();
+                    // A successful join is only the start of destination replication.
+                    SwitchingText = "Waiting for destination entities and player controls...";
+                }
+                catch (Exception ex)
+                {
+                    Seamless.TryShow(ex, "Destination initialization failed");
+                    FailTransfer("Destination initialization failed.");
+                }
             }
             else if (msg.JoinResult != JoinResult.OK && isSeamlessSwitching)
             {
-                Seamless.TryShow($"Failed to joing the target server: {msg.JoinResult}");
-                isSeamlessSwitching = false;
+                FailTransfer($"Destination rejected the join: {msg.JoinResult}");
             }
         }
 
-        private static CancellationTokenSource ConnectionWatchdog;
-        private static readonly TimeSpan WatchdogDuration = TimeSpan.FromMinutes(5);
-        private static readonly TimeSpan WatchdogInterval = TimeSpan.FromSeconds(5);
-
-        private static void StartConnectionWatchdog()
+        private static void DetachReplicationHandler()
         {
-            ConnectionWatchdog?.Cancel();
-            ConnectionWatchdog?.Dispose();
+            if (TransferClient != null && ReplicationHandler != null)
+                TransferClient.PendingReplicablesDone -= ReplicationHandler;
+            ReplicationHandler = null;
+        }
 
-            ConnectionWatchdog = new CancellationTokenSource();
-            var token = ConnectionWatchdog.Token;
+        private static void DetachTransferHandlers()
+        {
+            DetachReplicationHandler();
+            if (TransferClient != null && Instance != null)
+                TransferClient.HostLeft -= Instance.Static_HostLeft;
+            if (Instance != null)
+                MyGameService.Peer2Peer.ConnectionFailed -= Instance.Peer2Peer_ConnectionFailed;
+        }
 
-            Task.Run(async () =>
+        internal static void CancelTransfer()
+        {
+            DetachTransferHandlers();
+            TransferClient = null;
+            JoinAccepted = false;
+            ReplicationComplete = false;
+            isSeamlessSwitching = false;
+            WaitingForClientCheck = false;
+        }
+
+        private static void FailTransfer(string reason)
+        {
+            CancelTransfer();
+            MySandboxGame.IsPaused = false;
+            Seamless.TryShow("Transfer incomplete: " + reason);
+            MyAPIGateway.Utilities?.ShowMessage("Seamless",
+                "Transfer did not finish. Disconnect and rejoin the destination server. " + reason);
+        }
+
+        private static void UpdateTransferReadiness()
+        {
+            if (!isSeamlessSwitching)
+                return;
+
+            if (MySession.Static == null ||
+                (TransferClient != null && !ReferenceEquals(MyMultiplayer.Static, TransferClient)))
             {
-                var start = DateTime.UtcNow;
+                CancelTransfer();
+                return;
+            }
 
-                try
+            if (DateTime.UtcNow - TransferStartedUtc >= TransferTimeout)
+            {
+                FailTransfer($"Timed out (join={JoinAccepted}, replication={ReplicationComplete}, " +
+                    $"character={MySession.Static.LocalHumanPlayer?.Character != null}).");
+                return;
+            }
+
+            if (!JoinAccepted || !ReplicationComplete)
+                return;
+
+            var player = MySession.Static.LocalHumanPlayer;
+            var character = player?.Character;
+            if (player?.Identity == null || player.Controller == null || character == null ||
+                character.Closed || character.MarkedForClose)
+                return;
+
+            try
+            {
+                // Keep cockpit/remote-control ownership. Never force a seated player out.
+                var controlled = player.Controller.ControlledEntity;
+                if (controlled == null || controlled.Entity.Closed || controlled.Entity.MarkedForClose)
                 {
-                    while (DateTime.UtcNow - start < WatchdogDuration)
-                    {
-                        token.ThrowIfCancellationRequested();
-
-                        // A new seamless transfer has started elsewhere.
-                        if (isSeamlessSwitching)
-                        {
-                            ConnectionWatchdog.Cancel();
-                            return;
-                        }
-
-                        var tcs = new TaskCompletionSource<(bool healthy, double lastMsgAge)>();
-
-                        MySandboxGame.Static.Invoke(() =>
-                        {
-                            bool healthy =
-                                MySession.Static?.LocalHumanPlayer?.Identity != null &&
-                                MySession.Static?.LocalHumanPlayer?.Character != null;
-
-                            double lastMsgAge = -1;
-
-                            var totalSeconds = (DateTime.UtcNow - MyMultiplayer.Static?.LastMessageReceived)?.TotalSeconds;
-                            if (totalSeconds != null)
-                                lastMsgAge = (double)totalSeconds;
-
-                            tcs.SetResult((healthy, lastMsgAge));
-
-                        }, "ConnectionWatchdogCheck");
-
-                        var result = await tcs.Task;
-
-                        SwitchingText =
-                            $"Watchdog | LastMsg={result.lastMsgAge:F1}s | Healthy={result.healthy}";
-                        Seamless.TryShow(SwitchingText);
-
-                        // Instant reconnect if we've stopped receiving messages for 15+ seconds.
-                        if (result.lastMsgAge >= 15)
-                        {
-                            ConnectionWatchdog.Cancel();
-
-                            MySandboxGame.Static.Invoke(() =>
-                            {
-                                SwitchingText = "Connection stalled (15s). Reconnecting...";
-                                Seamless.TryShow(SwitchingText);
-
-                                Instance.StartBackendSwitch(TargetServer, TargetWorld);
-                            }, "ConnectionWatchdogReconnect");
-
-                            return;
-                        }
-
-                        if (result.healthy)
-                        {
-                            ConnectionWatchdog.Cancel();
-                            return;
-                        }
-
-                        await Task.Delay(WatchdogInterval, token);
-                    }
+                    if (character.Parent != null)
+                        return;
+                    player.Controller.TakeControl(character);
                 }
-                catch (OperationCanceledException)
-                {
-                }
-            }, token);
+                if (player.Controller.ControlledEntity == null)
+                    return;
+
+                if (ReferenceEquals(player.Controller.ControlledEntity, character))
+                    character.ResetControls();
+
+                MySession.Static.SetCameraController(MyCameraControllerEnum.Entity,
+                    player.Controller.ControlledEntity.Entity);
+                MyGuiScreenHudSpace.Static?.RecreateControls(true);
+                SwitchingText = "Transfer complete: destination replication and player controls ready.";
+                Seamless.TryShow(SwitchingText);
+                CancelTransfer();
+            }
+            catch (Exception ex)
+            {
+                // Do not retry engine calls every frame after an unexpected API failure.
+                Seamless.TryShow(ex, "Failed to restore destination player controls");
+                FailTransfer("Player controls could not be restored.");
+            }
         }
 
         public void StartBackendSwitch(MyGameServerItem _TargetServer, MyObjectBuilder_World _TargetWorld)
         {
+
+            if (isSeamlessSwitching)
+            {
+                Seamless.TryShow("Ignoring overlapping transfer while destination is still loading.");
+                return;
+            }
+            if (MySession.Static == null || _TargetServer == null || _TargetWorld?.Checkpoint == null ||
+                _TargetWorld.Sector == null)
+            {
+                Seamless.TryShow("Cannot start transfer: destination world or current session is missing.");
+                return;
+            }
+            CancelTransfer();
+            TransferStartedUtc = DateTime.UtcNow;
+            WaitingForClientCheck = true;
 
             if(MySession.Static.LocalCharacter != null)
             {
@@ -259,18 +292,26 @@ namespace SeamlessClient.Components
 
             MySandboxGame.Static.Invoke(delegate
             {
-                //Pause the game/update thread while we load
-                MySandboxGame.IsPaused = true;
+                try
+                {
+                    //Pause the game/update thread while we load
+                    MySandboxGame.IsPaused = true;
 
-                //Set camera controller to fixed spectator
-                MySession.Static.SetCameraController(MyCameraControllerEnum.SpectatorFixed);
-                UnloadCurrentServer();
-                SetNewMultiplayerClient();
-                ModAPI.StartModSwitching();
+                    //Set camera controller to fixed spectator
+                    MySession.Static.SetCameraController(MyCameraControllerEnum.SpectatorFixed);
+                    UnloadCurrentServer();
+                    SetNewMultiplayerClient();
+                    ModAPI.StartModSwitching();
 
-                //SeamlessClient.IsSwitching = false;
+                    //SeamlessClient.IsSwitching = false;
 
-                SwitchingText = "Waiting for server response...";
+                    SwitchingText = "Waiting for server response...";
+                }
+                catch (Exception ex)
+                {
+                    Seamless.TryShow(ex, "Destination connection setup failed");
+                    FailTransfer("Destination connection setup failed.");
+                }
             }, "SeamlessClient");
 
         }
@@ -287,6 +328,7 @@ namespace SeamlessClient.Components
 
 
             MyMultiplayer.Static = UtilExtensions.CastToReflected(instance, PatchUtils.ClientType);
+            TransferClient = MyMultiplayer.Static;
             MyMultiplayer.Static.ExperimentalMode = true;
             MyMultiplayer.Static.HostLeft += Static_HostLeft;
             MyGameService.Peer2Peer.ConnectionFailed += Peer2Peer_ConnectionFailed;
@@ -311,15 +353,14 @@ namespace SeamlessClient.Components
 
         private void Static_HostLeft()
         {
-            Seamless.TryShow($"MyMultiplayer Host Left. Returning to MainMenu. Transfer Failed.");
-            isSeamlessSwitching = false;
-            MyMultiplayer.Static.HostLeft -= Static_HostLeft;
+            if (isSeamlessSwitching && ReferenceEquals(MyMultiplayer.Static, TransferClient))
+                FailTransfer("Destination host disconnected.");
         }
 
         private void Peer2Peer_ConnectionFailed(ulong arg1, string arg2)
         {
-            Seamless.TryShow($"Seamless P2P Connection Failed {arg1} : {arg2}. Attempting to reconnect...");
-            MyGameService.Peer2Peer.ConnectionFailed -= Peer2Peer_ConnectionFailed;
+            if (isSeamlessSwitching && TargetServer != null && arg1 == TargetServer.SteamID)
+                FailTransfer("Destination P2P connection failed: " + arg2);
         }
 
         private static void ForceClientConnection()
@@ -572,9 +613,17 @@ namespace SeamlessClient.Components
             Sync.Players.RequestNewPlayer(Sync.MyId, 0, MyGameService.UserName, null, realPlayer: true, initialPlayer: true);
 
 
-            //Request client state batch
-            (MyMultiplayer.Static as MyMultiplayerClientBase).RequestBatchConfirmation();
-            MyMultiplayer.Static.PendingReplicablesDone += MyMultiplayer_PendingReplicablesDone;
+            // Subscribe before requesting the batch, including fast/local responses.
+            var client = TransferClient;
+            ReplicationHandler = () =>
+            {
+                if (!isSeamlessSwitching || !ReferenceEquals(TransferClient, client) ||
+                    !ReferenceEquals(MyMultiplayer.Static, client))
+                    return;
+                MyMultiplayer_PendingReplicablesDone();
+            };
+            client.PendingReplicablesDone += ReplicationHandler;
+            ((MyMultiplayerClientBase)client).RequestBatchConfirmation();
             //typeof(MyGuiScreenTerminal).GetMethod("CreateTabs")
 
             MySession.Static.LoadDataComponents();
@@ -587,16 +636,18 @@ namespace SeamlessClient.Components
             MyRenderProxy.CollectGarbage();
 
             Seamless.TryShow("OnlinePlayers: " + MySession.Static.Players.GetOnlinePlayers().Count);
-            Seamless.TryShow("Loading Complete!");
+            Seamless.TryShow("Entity sync requested; waiting for replication and player readiness.");
         }
 
         private static void MyMultiplayer_PendingReplicablesDone()
         {
-            if (MySession.Static.VoxelMaps.Instances.Count > 0)
+            if (MySession.Static != null && MySession.Static.VoxelMaps.Instances.Count > 0)
             {
                 MySandboxGame.AreClipmapsReady = false;
             }
-            MyMultiplayer.Static.PendingReplicablesDone -= MyMultiplayer_PendingReplicablesDone;
+            DetachReplicationHandler();
+            ReplicationComplete = true;
+            Seamless.TryShow("Destination replication batch complete; waiting for player controls.");
         }
 
 
