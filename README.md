@@ -1,3 +1,8 @@
+> Review workspace for Casimir: upstream source is preserved below. See
+> [confirmed 3.1.12 startup failure and exact-build repair](docs/3112_STARTUP_FAILURE.md),
+> [V1 readiness proposal and validation checklist](docs/TRANSFER_READINESS_REVIEW.md),
+> and [source provenance](UPSTREAM.md). Changes are not game-tested or a released build.
+
 # SeamlessClientPlugin (Re-write)
 The seamless client plugin lets you switch between SE servers without a loading screen. This currently *only* works with Nexus compatible servers as all data is shared and synced between them.
 

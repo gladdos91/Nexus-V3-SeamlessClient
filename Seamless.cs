@@ -1,4 +1,4 @@
-﻿using HarmonyLib;
+using HarmonyLib;
 using Sandbox;
 using Sandbox.Engine.Multiplayer;
 using Sandbox.Game.Localization;
@@ -43,7 +43,7 @@ namespace SeamlessClient
 
         public void Init(object gameInstance)
         {
-            //TryShow($"Running Seamless Client Plugin v[{SeamlessVersion}]");
+            TryShow($"Running Seamless Client Plugin v[{SeamlessVersion}] (V1 readiness review patch)");
             SeamlessPatcher = new Harmony("SeamlessClientPatcher");
             GetComponents();
             PatchComponents(SeamlessPatcher);
@@ -159,7 +159,7 @@ namespace SeamlessClient
 
         public void Dispose()
         {
-           
+            ServerSwitcherV1.CancelTransfer();
         }
 
 

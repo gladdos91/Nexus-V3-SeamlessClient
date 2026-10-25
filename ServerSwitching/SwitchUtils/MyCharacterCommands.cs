@@ -1,4 +1,4 @@
-﻿using Sandbox.Game;
+using Sandbox.Game;
 using Sandbox.Game.World;
 using Sandbox.ModAPI;
 using System;
@@ -29,7 +29,7 @@ namespace SeamlessClient.ServerSwitching.Commands
 
             string[] cmd = messageText.ToLowerInvariant().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
 
-            if (cmd[1] == "refreshcharacter")
+            if (cmd.Length > 1 && cmd[1] == "refreshcharacter")
             {
                 if (MySession.Static.LocalHumanPlayer == null)
                 {
